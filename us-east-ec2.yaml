@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: '2010-09-09'  
+Description: CloudFormation template to create an EC2 instance with a key pair and an EBS volume.  
+  
+Resources:  
+  MyEC2Instance:  
+    Type: 'AWS::EC2::Instance'  
+    Properties:  
+      InstanceType: t2.micro  
+      KeyName: jenkins  # Replace with your key pair name  
+      ImageId: ami-0c15e602d3d6c6c4a # AMI ID  
+      # BlockDeviceMappings:  
+      #   - DeviceName: /dev/sdp
+      #     Ebs:  
+      #       VolumeSize: 20  # Size in GB  
+      #       VolumeType: gp3
+  
+  MyVolume:  
+    Type: 'AWS::EC2::Volume'  
+    Properties:  
+      AvailabilityZone: !GetAtt MyEC2Instance.AvailabilityZone  
+      Size: 10 # Size in GB  
+      VolumeType: gp3 
+  
+  VolumeAttachment:  
+    Type: 'AWS::EC2::VolumeAttachment'  
+    Properties:  
+      InstanceId: !Ref MyEC2Instance  
+      VolumeId: !Ref MyVolume  
+      Device: /dev/sdp 
+  
+Outputs:  
+  InstanceId:  
+    Description: The Instance ID  
+    Value: !Ref MyEC2Instance  
+  # VolumeId:  
+  #   Description: The Volume ID  
+  #   Value: !Ref MyVolume  
