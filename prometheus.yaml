@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: PrometheusGrafana Stack
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Name of the application to be tagged on instances
+  NotificationEmail:
+    Description: Email address to which to send Autoscaling events
+    Type: String
+  VPCId:
+    Description: The VPC in which to deploy the Prometheus+Grafana Stack
+    Type: "AWS::EC2::VPC::Id"
+    ConstraintDescription: Must be the ID of a VPC
+  LoadBalancerSubnets:
+    Description: >-
+      Subnets (three) in which to deploy the resources for the Prometheus+Grafana
+      stack. These subnets MUST be within the specified VPC.
+    Type: "List<AWS::EC2::Subnet::Id>"
+    ConstraintDescription: Must be a list of three Subnet ID's within the specified VPC
+  AmiId:
+    Description: AMI Id of the image for the Prometheus+Grafana instance
+    Type: "AWS::EC2::Image::Id"
+  KeyPairName:
+    Description: The EC2 Key Pair to allow SSH access to the Prometheus+Grafana instances
+    Type: "AWS::EC2::KeyPair::KeyName"
+    ConstraintDescription: Must be the name of an existing EC2 Key Pair
+  Route53Entry:
+    Description: The DNS to be used to map to the active instance (Remove the trialing ".")
+    Type: String
+    ConstraintDescription: Must be within a valid domain within the account
+  PrometheusInstanceType:
+    Description: EC2 instance type for the Prometheus+Grafana instances
+    Type: String
+    AllowedValues:
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - r5.large
+      - r5.xlarge
+      - r5.2xlarge
+      - r6g.xlarge
+    Default: r5.xlarge
+    ConstraintDescription: >-
+      Must be an EC2 instance type in the C, M, R, family, large or larger
+
+Resources:
+  ElasticFileSystem:
+    Type: "AWS::EFS::FileSystem"
+    Properties:
+      FileSystemTags:
+        - Key: "nbn:application"
+          Value: !Ref ApplicationName
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_60_DAYS
+      Encrypted: true
+      KmsKeyId: 07bbe056-34ab-47d1-9949-bf15480e7629   #Please Lookup your own for different deployment
+  EFSMountAz1:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref ElasticFileSystem
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+      SubnetId: !Select
+        - 0
+        - !Ref LoadBalancerSubnets
+  EFSMountAz2:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref ElasticFileSystem
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+      SubnetId: !Select
+        - 1
+        - !Ref LoadBalancerSubnets
+  EFSMountAz3:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref ElasticFileSystem
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+      SubnetId: !Select
+        - 2
+        - !Ref LoadBalancerSubnets
+  EFSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Security group allowing EFS access
+      VpcId: !Ref VPCId
+      Tags:
+        - Key: "nbn:application"
+          Value: !Ref ApplicationName
+  InstanceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: >-
+        Allow inbound traffic to Atlassian Software application from Load
+        Balancers
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: "nbn:application"
+          Value: !Ref ApplicationName
+  EFSSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref EFSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref InstanceSecurityGroup
+  InstanceLaunchConfiguration:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref PrometheusInstanceType
+      IamInstanceProfile: "arn:aws:iam::509187155404:instance-profile/dbaEc2S3BucketAccessRole"
+      KeyName: !Ref KeyPairName
+      AssociatePublicIpAddress: false
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+          #! /bin/bash -ex
+          echo "===================Mounting EFS===================" | tee /tmp/userdata.out
+          /ora_stage/efs-userdata-mount.sh ${ElasticFileSystem} /GGEFS debug | tee -a /tmp/userdata.out
+          echo "===================Update DNS IP===================" | tee -a /tmp/userdata.out
+          /ora_stage/upsert_DNS_IP.sh ${Route53Entry} | tee -a /tmp/userdata.out
+          echo "===================Enable Oracle ssh login ===================" | tee -a /tmp/userdata.out
+          cat /etc/ssh/sshd_config | sed 's/PasswordAuthentication no/PasswordAuthentication yes/' > /etc/ssh/sshd_config.tmp.1stStart
+          mv /etc/ssh/sshd_config /etc/ssh/sshd_config.orig.1stStart
+          mv -f /etc/ssh/sshd_config.tmp.1stStart /etc/ssh/sshd_config
+          service sshd restart | tee -a /tmp/userdata.out
+          echo "===================Run Daily Refresh For RDS Snapshot===================" | tee -a /tmp/userdata.out
+          /GGEFS/aws_utils/install_dependencies.sh
+          cd /GGEFS/daily_poll; ./get_current_RDS.sh | tee -a /tmp/userdata.out
+          cd /GGEFS/spark/scripts; /GGEFS/spark/pyspark.sh get_current_RDS.py | tee -a /tmp/userdata.out
+          su -l oracle -c "cd /GGEFS/prometheus_exporters/oracledb_exporter.0.2.2.linux-amd64; ./gen_oracle_exporters.sh" | tee -a /tmp/userdata.out
+          su -l oracle -c "cd /GGEFS/prometheus_exporters/postgres_exporter_latest; ./gen_postgres_exporters.sh" | tee -a /tmp/userdata.out
+          echo "===================Fireup all server processes ===================" | tee -a /tmp/userdata.out
+          cd /GGEFS/pushgateway/pushgateway-latest; ./pushgateway --web.listen-address :9091 &
+          /GGEFS/thanos/thanos-0.9.0.linux-amd64/run_thanos.sh
+          su -l oracle -c "/GGEFS/prometheus/prometheus-2.14.0.linux-amd64/prometheus_admin.sh start"
+          cd /GGEFS/grafana/grafana-latest/bin; ./grafana-server &
+          su -l oracle -c "/GGEFS/prometheus_exporters/oracledb_exporter.0.2.2.linux-amd64/exporter_runner.sh > /dev/null 2>&1"
+          su -l oracle -c "cd /GGEFS/prometheus_exporters/postgres_exporter_latest; ./exporter_runner.sh > /dev/null 2>&1"
+          echo "===================Daily miscellaneous job run ===================" | tee -a /tmp/userdata.out
+          # Daily Runs
+          /GGEFS/daily_poll/scripts/daily_runs.sh | tee -a /tmp/userdata.out
+          /GGEFS/daily_poll/scripts/delivery_weekly_patching_compliance_rpt.sh | tee -a /tmp/userdata.out
+          # Stopping services throwing errors:
+          service telegraf disable | tee -a /tmp/userdata.out
+      MetadataOptions:
+        HttpTokens: "required"
+        HttpEndpoint: "enabled"
+  PrometheusAutoScaleTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: !Sub 'Prometheus_${ApplicationName}_Topic'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      LaunchConfigurationName: !Ref InstanceLaunchConfiguration
+      MinSize: "1"
+      DesiredCapacity: "1"
+      MaxSize: "1"
+      VPCZoneIdentifier: !Ref LoadBalancerSubnets
+      NotificationConfigurations:
+        - TopicARN: !Ref PrometheusAutoScaleTopic
+          NotificationTypes:
+            - "autoscaling:EC2_INSTANCE_LAUNCH"
+      Tags:
+        - Key: "nbn:application"
+          Value: !Ref ApplicationName
+          PropagateAtLaunch: true
+        - Key: Name
+          Value: !Sub "PrometheusGrafana ${ApplicationName}"
+          PropagateAtLaunch: true
